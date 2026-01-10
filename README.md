@@ -1,4 +1,4 @@
-# DEV Claude Skills
+# Everyday development Claude Skills
 
 A collection of useful Claude Code skills for daily development and ops work.
 

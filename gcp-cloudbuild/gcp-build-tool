@@ -1,0 +1,577 @@
+#!/usr/bin/env bash
+#
+# gcp-build-tool - Unified Cloud Build management tool
+#
+# Usage:
+#   gcp-build-tool <command> [options]
+#
+# Commands:
+#   auth              Verify authentication and show current project
+#   list              List all Cloud Build triggers
+#   details <trigger> Show details for a specific trigger
+#   history [trigger] Show build history (optionally filtered by trigger)
+#   running           Show currently running builds
+#   start <trigger>   Start a build from a trigger
+#   help              Show this help message
+#
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Helper function to check gcloud
+check_gcloud() {
+    if ! command -v gcloud &> /dev/null; then
+        echo -e "${RED}❌ ERROR: gcloud CLI not found${NC}"
+        echo "Install Google Cloud SDK: https://cloud.google.com/sdk/docs/install"
+        exit 1
+    fi
+}
+
+# Helper function to get current project
+get_project() {
+    gcloud config get-value project 2>/dev/null || echo "unknown"
+}
+
+# Helper function to get current account
+get_account() {
+    gcloud config get-value account 2>/dev/null || echo ""
+}
+
+# ============================================================================
+# Command: auth
+# ============================================================================
+cmd_auth() {
+    echo "============================================================"
+    echo "GCP Cloud Build - Authentication Check"
+    echo "============================================================"
+    
+    check_gcloud
+    
+    local account=$(get_account)
+    if [[ -z "$account" ]]; then
+        echo -e "\n${RED}❌ ERROR: Not authenticated${NC}"
+        echo -e "\nTo authenticate, run:"
+        echo "  gcloud auth login"
+        exit 1
+    fi
+    
+    local project=$(get_project)
+    if [[ -z "$project" || "$project" == "unknown" ]]; then
+        echo -e "\n${GREEN}✅ Authenticated as: ${account}${NC}"
+        echo -e "\n${RED}❌ ERROR: No project configured${NC}"
+        echo -e "\nTo set a project, run:"
+        echo "  gcloud config set project PROJECT_ID"
+        exit 1
+    fi
+    
+    # Verify Cloud Build API access
+    if ! gcloud builds list --limit=1 &>/dev/null; then
+        echo -e "\n${GREEN}✅ Authenticated as: ${account}${NC}"
+        echo -e "${GREEN}✅ Current project: ${project}${NC}"
+        echo -e "\n${RED}❌ ERROR: Cannot access Cloud Build API${NC}"
+        echo -e "\nPossible issues:"
+        echo "  1. Cloud Build API not enabled"
+        echo "     → gcloud services enable cloudbuild.googleapis.com"
+        echo "  2. Insufficient permissions"
+        echo "     → Need roles/cloudbuild.builds.viewer or higher"
+        exit 1
+    fi
+    
+    local project_number=$(gcloud projects describe "$project" --format="value(projectNumber)" 2>/dev/null || echo "")
+    
+    echo -e "\n${GREEN}✅ Authentication verified${NC}"
+    echo ""
+    echo "────────────────────────────────────────"
+    echo "  Account:        $account"
+    echo "  Project ID:     $project"
+    [[ -n "$project_number" ]] && echo "  Project Number: $project_number"
+    echo "────────────────────────────────────────"
+    echo -e "\n${GREEN}✅ Ready to manage Cloud Build in project: ${project}${NC}"
+}
+
+# ============================================================================
+# Command: list
+# ============================================================================
+cmd_list() {
+    local project=$(get_project)
+    echo "======================================================================"
+    echo "Cloud Build Triggers - Project: $project"
+    echo "======================================================================"
+    
+    local triggers=$(gcloud builds triggers list --format=json 2>/dev/null)
+    
+    if [[ -z "$triggers" || "$triggers" == "[]" ]]; then
+        echo -e "\nNo Cloud Build triggers found in this project."
+        echo -e "\nTo create a trigger:"
+        echo "  gcloud builds triggers create [github|cloud-source-repositories|webhook] ..."
+        exit 0
+    fi
+    
+    local count=$(echo "$triggers" | jq 'length')
+    echo -e "\nFound ${count} trigger(s):\n"
+    
+    echo "$triggers" | jq -r '.[] | "──────────────────────────────────────────────────────────────────────\n  Name:        \(.name // "unnamed")\n  ID:          \(.id // "")\n  Status:      \(if .disabled then "🔴 DISABLED" else "🟢 ENABLED" end)\n  Type:        \(if .github then "GitHub" elif .triggerTemplate then "Cloud Source" elif .webhookConfig then "Webhook" else "Manual" end)\n  Description: \(.description // "No description" | .[0:60])"'
+    
+    echo "──────────────────────────────────────────────────────────────────────"
+    echo -e "\n💡 For details: gcp-build-tool details <trigger-name-or-id>"
+}
+
+# ============================================================================
+# Command: details
+# ============================================================================
+cmd_details() {
+    local trigger_ref="${1:-}"
+    
+    if [[ -z "$trigger_ref" ]]; then
+        echo -e "${RED}❌ ERROR: Trigger name or ID required${NC}"
+        echo "Usage: gcp-build-tool details <trigger-name-or-id>"
+        exit 1
+    fi
+    
+    local project=$(get_project)
+    echo "======================================================================"
+    echo "Cloud Build Trigger Details - Project: $project"
+    echo "======================================================================"
+    
+    # Try to get trigger info
+    local trigger=$(gcloud builds triggers describe "$trigger_ref" --format=json 2>/dev/null || echo "")
+    
+    # If not found by ID, search by name
+    if [[ -z "$trigger" ]]; then
+        trigger=$(gcloud builds triggers list --format=json 2>/dev/null | jq -r --arg name "$trigger_ref" '.[] | select(.name == $name or .id == $name)')
+    fi
+    
+    if [[ -z "$trigger" ]]; then
+        echo -e "\n${RED}❌ ERROR: Trigger '$trigger_ref' not found${NC}"
+        echo -e "\nAvailable triggers:"
+        gcloud builds triggers list --format="table(name,id)" 2>/dev/null
+        exit 1
+    fi
+    
+    local name=$(echo "$trigger" | jq -r '.name // "unnamed"')
+    local id=$(echo "$trigger" | jq -r '.id // ""')
+    local description=$(echo "$trigger" | jq -r '.description // "No description"')
+    local disabled=$(echo "$trigger" | jq -r '.disabled // false')
+    local create_time=$(echo "$trigger" | jq -r '.createTime // "unknown"')
+    local filename=$(echo "$trigger" | jq -r '.filename // ""')
+    
+    local status="🟢 ENABLED"
+    [[ "$disabled" == "true" ]] && status="🔴 DISABLED"
+    
+    echo -e "\n📋 BASIC INFORMATION"
+    echo "──────────────────────────────────────────────────"
+    echo "  Name:        $name"
+    echo "  ID:          $id"
+    echo "  Status:      $status"
+    echo "  Created:     $create_time"
+    echo "  Description: $description"
+    
+    echo -e "\n📦 SOURCE CONFIGURATION"
+    echo "──────────────────────────────────────────────────"
+    
+    if echo "$trigger" | jq -e '.github' &>/dev/null; then
+        local owner=$(echo "$trigger" | jq -r '.github.owner // "N/A"')
+        local repo=$(echo "$trigger" | jq -r '.github.name // "N/A"')
+        echo "  Type:     GitHub"
+        echo "  Owner:    $owner"
+        echo "  Repo:     $repo"
+        
+        if echo "$trigger" | jq -e '.github.push.branch' &>/dev/null; then
+            local branch=$(echo "$trigger" | jq -r '.github.push.branch')
+            echo "  Trigger:  Push to branch matching: $branch"
+        elif echo "$trigger" | jq -e '.github.push.tag' &>/dev/null; then
+            local tag=$(echo "$trigger" | jq -r '.github.push.tag')
+            echo "  Trigger:  Tag matching: $tag"
+        elif echo "$trigger" | jq -e '.github.pullRequest' &>/dev/null; then
+            local pr_branch=$(echo "$trigger" | jq -r '.github.pullRequest.branch // "any"')
+            echo "  Trigger:  Pull request to branch: $pr_branch"
+        fi
+    elif echo "$trigger" | jq -e '.triggerTemplate' &>/dev/null; then
+        echo "  Type:     Cloud Source Repository"
+        local repo_name=$(echo "$trigger" | jq -r '.triggerTemplate.repoName // "N/A"')
+        echo "  Repo:     $repo_name"
+    elif echo "$trigger" | jq -e '.webhookConfig' &>/dev/null; then
+        echo "  Type:     Webhook"
+    else
+        echo "  Type:     Manual"
+    fi
+    
+    echo -e "\n🔧 BUILD CONFIGURATION"
+    echo "──────────────────────────────────────────────────"
+    if [[ -n "$filename" ]]; then
+        echo "  Config:   File: $filename"
+    elif echo "$trigger" | jq -e '.build' &>/dev/null; then
+        echo "  Config:   Inline build config"
+    else
+        echo "  Config:   Not specified"
+    fi
+    
+    # Show substitutions
+    if echo "$trigger" | jq -e '.substitutions | length > 0' &>/dev/null; then
+        echo -e "\n📝 SUBSTITUTION VARIABLES"
+        echo "──────────────────────────────────────────────────"
+        echo "$trigger" | jq -r '.substitutions | to_entries[] | "  \(.key): \(.value)"'
+    fi
+    
+    # Show build steps if inline
+    if echo "$trigger" | jq -e '.build.steps' &>/dev/null; then
+        local step_count=$(echo "$trigger" | jq '.build.steps | length')
+        echo -e "\n🚀 BUILD STEPS ($step_count steps)"
+        echo "──────────────────────────────────────────────────"
+        echo "$trigger" | jq -r '.build.steps | to_entries[] | "\n  Step \(.key + 1): \(.value.id // "step-\(.key + 1)")\n    Image: \(.value.name)"'
+    fi
+    
+    echo -e "\n▶️  HOW TO TRIGGER THIS BUILD"
+    echo "──────────────────────────────────────────────────"
+    echo "  Using this tool:"
+    echo "    gcp-build-tool start $name"
+    
+    if echo "$trigger" | jq -e '.substitutions | length > 0' &>/dev/null; then
+        echo -e "\n  With substitutions:"
+        local sub_example=$(echo "$trigger" | jq -r '.substitutions | keys[0:2][] | "--sub \(.)=VALUE"' | tr '\n' ' ')
+        echo "    gcp-build-tool start $name $sub_example"
+    fi
+    
+    echo -e "\n  Using gcloud directly:"
+    echo "    gcloud builds triggers run $id"
+}
+
+# ============================================================================
+# Command: history
+# ============================================================================
+cmd_history() {
+    local trigger_ref="${1:-}"
+    local limit="${2:-10}"
+    
+    local project=$(get_project)
+    echo "================================================================================"
+    local title="Cloud Build History - Project: $project"
+    [[ -n "$trigger_ref" ]] && title="$title - Trigger: $trigger_ref"
+    echo "$title"
+    echo "================================================================================"
+    
+    local filter=""
+    if [[ -n "$trigger_ref" ]]; then
+        # Find trigger ID
+        local trigger_id=$(gcloud builds triggers list --format=json 2>/dev/null | jq -r --arg ref "$trigger_ref" '.[] | select(.name == $ref or .id == $ref) | .id')
+        if [[ -n "$trigger_id" ]]; then
+            filter="--filter=build_trigger_id=\"$trigger_id\""
+        else
+            echo -e "\n${YELLOW}⚠️  Warning: Trigger '$trigger_ref' not found, showing all builds${NC}"
+        fi
+    fi
+    
+    local builds
+    if [[ -n "$filter" ]]; then
+        builds=$(gcloud builds list --limit="$limit" $filter --format=json 2>/dev/null)
+    else
+        builds=$(gcloud builds list --limit="$limit" --format=json 2>/dev/null)
+    fi
+    
+    if [[ -z "$builds" || "$builds" == "[]" ]]; then
+        echo -e "\nNo builds found matching criteria."
+        exit 0
+    fi
+    
+    local count=$(echo "$builds" | jq 'length')
+    echo -e "\nShowing $count build(s):\n"
+    
+    echo "$builds" | jq -r '.[] | 
+        "────────────────────────────────────────────────────────────────────────────────\n  \(
+            if .status == "SUCCESS" then "✅" 
+            elif .status == "FAILURE" then "❌"
+            elif .status == "WORKING" then "🔄"
+            elif .status == "QUEUED" then "⏳"
+            elif .status == "TIMEOUT" then "⏱️"
+            elif .status == "CANCELLED" then "🚫"
+            else "❓" end
+        ) \(.status | . + " " * (12 - length)) │ ID: \(.id[0:8]) │ Duration: \(
+            if .startTime and .finishTime then
+                ((.finishTime | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) - (.startTime | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601)) | 
+                if . < 60 then "\(.)s"
+                elif . < 3600 then "\(. / 60 | floor)m \(. % 60)s"
+                else "\(. / 3600 | floor)h \((. % 3600) / 60 | floor)m"
+                end
+            elif .startTime then "running..."
+            else "pending"
+            end
+        )\n     Started:    \(.startTime // .createTime | sub("\\.[0-9]+Z$"; "Z") | sub("T"; " ") | sub("Z"; ""))\n     Trigger:    \(.buildTriggerId // "manual" | .[0:20])\(
+            if .substitutions.COMMIT_SHA then "\n     Commit:     \(.substitutions.COMMIT_SHA[0:7])" else "" end
+        )\(
+            if .status == "FAILURE" or .status == "TIMEOUT" then "\n     Logs:       \(.logUrl // "N/A")" else "" end
+        )"'
+    
+    echo "────────────────────────────────────────────────────────────────────────────────"
+    
+    # Summary
+    echo -e "\n📊 Summary: $(echo "$builds" | jq -r '[.[] | .status] | group_by(.) | map("\(.[0]): \(length)") | join(" │ ")')"
+}
+
+# ============================================================================
+# Command: running
+# ============================================================================
+cmd_running() {
+    local project=$(get_project)
+    echo "================================================================================"
+    echo "Running Cloud Builds - Project: $project"
+    echo "================================================================================"
+    
+    local builds=$(gcloud builds list --ongoing --format=json 2>/dev/null)
+    
+    if [[ -z "$builds" || "$builds" == "[]" ]]; then
+        echo -e "\n${GREEN}✨ No builds currently running or queued.${NC}"
+        echo -e "\n💡 To view recent builds: gcp-build-tool history"
+        exit 0
+    fi
+    
+    local working=$(echo "$builds" | jq '[.[] | select(.status == "WORKING")]')
+    local queued=$(echo "$builds" | jq '[.[] | select(.status == "QUEUED" or .status == "PENDING")]')
+    
+    local working_count=$(echo "$working" | jq 'length')
+    local queued_count=$(echo "$queued" | jq 'length')
+    
+    if [[ "$working_count" -gt 0 ]]; then
+        echo -e "\n🔄 CURRENTLY RUNNING ($working_count):"
+        echo "────────────────────────────────────────────────────────────────────────────────"
+        
+        echo "$working" | jq -r '.[] | 
+            "\n  Build ID:    \(.id[0:8])\n  Trigger:     \(.buildTriggerId // "manual" | .[0:30])\n  Running for: \(
+                if .startTime then
+                    ((now - (.startTime | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601)) | 
+                    if . < 60 then "\(. | floor)s"
+                    elif . < 3600 then "\(. / 60 | floor)m \(. % 60 | floor)s"
+                    else "\(. / 3600 | floor)h \((. % 3600) / 60 | floor)m"
+                    end)
+                else "N/A"
+                end
+            )\(if .substitutions.COMMIT_SHA then "\n  Commit:      \(.substitutions.COMMIT_SHA[0:7])" else "" end)\n  Logs:        \(.logUrl // "N/A")"'
+    fi
+    
+    if [[ "$queued_count" -gt 0 ]]; then
+        echo -e "\n⏳ QUEUED ($queued_count):"
+        echo "────────────────────────────────────────────────────────────────────────────────"
+        
+        echo "$queued" | jq -r '.[] | 
+            "\n  Build ID:  \(.id[0:8])\n  Trigger:   \(.buildTriggerId // "manual" | .[0:30])"'
+    fi
+    
+    echo -e "\n────────────────────────────────────────────────────────────────────────────────"
+    echo -e "\n📊 Summary: 🔄 Running: $working_count │ ⏳ Queued: $queued_count"
+    echo -e "\n💡 To cancel a build: gcloud builds cancel BUILD_ID"
+}
+
+# ============================================================================
+# Command: start
+# ============================================================================
+cmd_start() {
+    local trigger_ref="${1:-}"
+    shift || true
+    
+    if [[ -z "$trigger_ref" ]]; then
+        echo -e "${RED}❌ ERROR: Trigger name or ID required${NC}"
+        echo "Usage: gcp-build-tool start <trigger> [--sub KEY=VALUE] [--branch BRANCH] [--tag TAG]"
+        exit 1
+    fi
+    
+    local project=$(get_project)
+    echo "======================================================================"
+    echo "Start Cloud Build - Project: $project"
+    echo "======================================================================"
+    
+    # Find trigger
+    local trigger=$(gcloud builds triggers list --format=json 2>/dev/null | jq -r --arg ref "$trigger_ref" '.[] | select(.name == $ref or .id == $ref)')
+    
+    if [[ -z "$trigger" ]]; then
+        echo -e "\n${RED}❌ ERROR: Trigger '$trigger_ref' not found${NC}"
+        echo -e "\nAvailable triggers:"
+        gcloud builds triggers list --format="table(name,id)" 2>/dev/null
+        exit 1
+    fi
+    
+    local trigger_id=$(echo "$trigger" | jq -r '.id')
+    local trigger_name=$(echo "$trigger" | jq -r '.name')
+    local disabled=$(echo "$trigger" | jq -r '.disabled // false')
+    
+    [[ "$disabled" == "true" ]] && echo -e "\n${YELLOW}⚠️  WARNING: Trigger '$trigger_name' is DISABLED${NC}"
+    
+    echo -e "\n📋 Trigger: $trigger_name"
+    echo "   ID:      $trigger_id"
+    
+    # Parse remaining arguments
+    local substitutions=""
+    local branch=""
+    local tag=""
+    local sha=""
+    local dry_run=false
+    
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --sub|-s)
+                if [[ -n "$substitutions" ]]; then
+                    substitutions="$substitutions,$2"
+                else
+                    substitutions="$2"
+                fi
+                shift 2
+                ;;
+            --branch|-b)
+                branch="$2"
+                shift 2
+                ;;
+            --tag|-t)
+                tag="$2"
+                shift 2
+                ;;
+            --sha)
+                sha="$2"
+                shift 2
+                ;;
+            --dry-run)
+                dry_run=true
+                shift
+                ;;
+            *)
+                echo -e "${RED}❌ Unknown option: $1${NC}"
+                exit 1
+                ;;
+        esac
+    done
+    
+    # Build gcloud command
+    local cmd="gcloud builds triggers run $trigger_id"
+    
+    [[ -n "$branch" ]] && cmd="$cmd --branch=$branch" && echo "   Branch:  $branch"
+    [[ -n "$tag" ]] && cmd="$cmd --tag=$tag" && echo "   Tag:     $tag"
+    [[ -n "$sha" ]] && cmd="$cmd --sha=$sha" && echo "   SHA:     $sha"
+    [[ -n "$substitutions" ]] && cmd="$cmd --substitutions=$substitutions"
+    
+    # Show substitutions
+    if [[ -n "$substitutions" ]]; then
+        echo -e "\n📝 Substitutions:"
+        echo "$substitutions" | tr ',' '\n' | while read sub; do
+            echo "   $sub"
+        done
+    fi
+    
+    if [[ "$dry_run" == true ]]; then
+        echo -e "\n🔍 DRY RUN - Command that would be executed:"
+        echo "   $cmd"
+        exit 0
+    fi
+    
+    echo -e "\n▶️  Starting build..."
+    
+    if eval "$cmd"; then
+        echo -e "\n${GREEN}✅ Build started successfully!${NC}"
+        echo -e "\n💡 Useful commands:"
+        echo "   View running builds:  gcp-build-tool running"
+        echo "   View build history:   gcp-build-tool history $trigger_name"
+        echo "   Cancel build:         gcloud builds cancel BUILD_ID"
+    else
+        echo -e "\n${RED}❌ ERROR: Failed to start build${NC}"
+        exit 1
+    fi
+}
+
+# ============================================================================
+# Command: help
+# ============================================================================
+cmd_help() {
+    cat << 'EOF'
+gcp-build-tool - Unified Cloud Build management tool
+
+USAGE:
+    gcp-build-tool <command> [options]
+
+COMMANDS:
+    auth                    Verify authentication and show current project
+    list                    List all Cloud Build triggers
+    details <trigger>       Show details for a specific trigger
+    history [trigger]       Show build history (optionally filtered by trigger)
+    running                 Show currently running builds
+    start <trigger>         Start a build from a trigger
+    help                    Show this help message
+
+EXAMPLES:
+    # Check authentication
+    gcp-build-tool auth
+
+    # List all triggers
+    gcp-build-tool list
+
+    # View trigger details
+    gcp-build-tool details my-deploy-trigger
+
+    # View build history
+    gcp-build-tool history
+    gcp-build-tool history my-deploy-trigger
+
+    # Check running builds
+    gcp-build-tool running
+
+    # Start a build
+    gcp-build-tool start my-deploy-trigger
+    gcp-build-tool start my-deploy-trigger --branch main
+    gcp-build-tool start my-deploy-trigger --sub _ENV=prod --sub _VERSION=1.2.3
+
+START OPTIONS:
+    --sub, -s KEY=VALUE     Substitution variable (can be repeated)
+    --branch, -b BRANCH     Git branch to build
+    --tag, -t TAG           Git tag to build  
+    --sha SHA               Git commit SHA to build
+    --dry-run               Show command without executing
+
+AUTHENTICATION:
+    If not authenticated, run:
+        gcloud auth login
+        gcloud config set project PROJECT_ID
+
+EOF
+}
+
+# ============================================================================
+# Main
+# ============================================================================
+main() {
+    local command="${1:-help}"
+    shift || true
+    
+    case "$command" in
+        auth)
+            cmd_auth "$@"
+            ;;
+        list|ls)
+            cmd_list "$@"
+            ;;
+        details|show|describe)
+            cmd_details "$@"
+            ;;
+        history|hist|logs)
+            cmd_history "$@"
+            ;;
+        running|status)
+            cmd_running "$@"
+            ;;
+        start|run|trigger)
+            cmd_start "$@"
+            ;;
+        help|--help|-h)
+            cmd_help
+            ;;
+        *)
+            echo -e "${RED}❌ Unknown command: $command${NC}"
+            echo "Run 'gcp-build-tool help' for usage information."
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"

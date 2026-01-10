@@ -1,6 +1,6 @@
-# Claude Skills Collection
+# DEV Claude Skills
 
-A collection of useful Claude Code skills for daily work.
+A collection of useful Claude Code skills for daily development and ops work.
 
 ## Available Skills
 

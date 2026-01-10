@@ -1,0 +1,1018 @@
+#!/usr/bin/env bash
+#
+# gh-actions-tool - Unified GitHub Actions management tool
+#
+# Usage:
+#   gh-actions-tool <command> [options]
+#
+# Commands:
+#   auth                    Verify authentication and show current context
+#   list                    List all workflows in the repository
+#   details <workflow>      Show details for a specific workflow
+#   runs [workflow]         Show recent workflow runs
+#   running                 Show currently in-progress runs
+#   start <workflow>        Trigger a workflow_dispatch
+#   logs <run-id>           Fetch and display logs for a run
+#   cancel <run-id>         Cancel a running workflow
+#   help                    Show this help message
+#
+
+set -euo pipefail
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+NC='\033[0m' # No Color
+
+# Global repo variable
+REPO=""
+
+# Helper function to check gh CLI
+check_gh() {
+    if ! command -v gh &> /dev/null; then
+        echo -e "${RED}ERROR: gh CLI not found${NC}"
+        echo "Install GitHub CLI: https://cli.github.com/"
+        exit 1
+    fi
+}
+
+# Helper function to check jq
+check_jq() {
+    if ! command -v jq &> /dev/null; then
+        echo -e "${RED}ERROR: jq not found${NC}"
+        echo "Install jq: https://jqlang.github.io/jq/download/"
+        exit 1
+    fi
+}
+
+# Helper function to detect repo from git remote
+detect_repo() {
+    local remote_url
+    remote_url=$(git remote get-url origin 2>/dev/null || echo "")
+
+    if [[ -z "$remote_url" ]]; then
+        echo ""
+        return
+    fi
+
+    # Handle SSH format: git@github.com:owner/repo.git
+    if [[ "$remote_url" =~ git@github\.com:([^/]+)/(.+)(\.git)?$ ]]; then
+        local owner="${BASH_REMATCH[1]}"
+        local repo="${BASH_REMATCH[2]}"
+        repo="${repo%.git}"
+        echo "$owner/$repo"
+        return
+    fi
+
+    # Handle HTTPS format: https://github.com/owner/repo.git
+    if [[ "$remote_url" =~ github\.com/([^/]+)/(.+)(\.git)?$ ]]; then
+        local owner="${BASH_REMATCH[1]}"
+        local repo="${BASH_REMATCH[2]}"
+        repo="${repo%.git}"
+        echo "$owner/$repo"
+        return
+    fi
+
+    echo ""
+}
+
+# Helper function to get or detect repo
+get_repo() {
+    local explicit_repo="${1:-}"
+
+    if [[ -n "$explicit_repo" ]]; then
+        echo "$explicit_repo"
+        return
+    fi
+
+    local detected
+    detected=$(detect_repo)
+
+    if [[ -z "$detected" ]]; then
+        echo -e "${RED}ERROR: Could not detect repository${NC}" >&2
+        echo "Please specify --repo owner/repo or run from a git repository with a GitHub remote." >&2
+        exit 1
+    fi
+
+    echo "$detected"
+}
+
+# Parse common options and extract --repo
+parse_repo_option() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --repo|-R)
+                REPO="$2"
+                shift 2
+                ;;
+            *)
+                shift
+                ;;
+        esac
+    done
+}
+
+# ============================================================================
+# Command: auth
+# ============================================================================
+cmd_auth() {
+    echo "============================================================"
+    echo "GitHub Actions - Authentication Check"
+    echo "============================================================"
+
+    check_gh
+    check_jq
+
+    # Check auth status
+    if ! gh auth status &>/dev/null; then
+        echo -e "\n${RED}ERROR: Not authenticated${NC}"
+        echo -e "\nTo authenticate, run:"
+        echo "  gh auth login"
+        exit 1
+    fi
+
+    local user
+    user=$(gh api user --jq '.login' 2>/dev/null || echo "unknown")
+
+    local detected_repo
+    detected_repo=$(detect_repo)
+
+    echo -e "\n${GREEN}Authentication verified${NC}"
+    echo ""
+    echo "----------------------------------------"
+    echo "  User:       $user"
+    if [[ -n "$detected_repo" ]]; then
+        echo "  Repository: $detected_repo (auto-detected)"
+
+        # Verify access to the repo
+        if gh repo view "$detected_repo" &>/dev/null; then
+            echo -e "  Access:     ${GREEN}Confirmed${NC}"
+        else
+            echo -e "  Access:     ${YELLOW}Cannot verify (may be private or inaccessible)${NC}"
+        fi
+    else
+        echo "  Repository: Not detected (not in a git repo with GitHub remote)"
+    fi
+    echo "----------------------------------------"
+    echo -e "\n${GREEN}Ready to manage GitHub Actions${NC}"
+}
+
+# ============================================================================
+# Command: list
+# ============================================================================
+cmd_list() {
+    local repo_arg=""
+
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --repo|-R)
+                repo_arg="$2"
+                shift 2
+                ;;
+            *)
+                shift
+                ;;
+        esac
+    done
+
+    local repo
+    repo=$(get_repo "$repo_arg")
+
+    echo "======================================================================"
+    echo "GitHub Actions Workflows - Repository: $repo"
+    echo "======================================================================"
+
+    local workflows
+    workflows=$(gh api "repos/$repo/actions/workflows" --jq '.workflows' 2>/dev/null || echo "[]")
+
+    if [[ "$workflows" == "[]" || -z "$workflows" ]]; then
+        echo -e "\nNo workflows found in this repository."
+        echo -e "\nWorkflows are defined in .github/workflows/*.yml files."
+        exit 0
+    fi
+
+    local count
+    count=$(echo "$workflows" | jq 'length')
+    echo -e "\nFound ${count} workflow(s):\n"
+
+    echo "$workflows" | jq -r '.[] | "----------------------------------------------------------------------\n  Name:   \(.name)\n  File:   \(.path)\n  Status: \(if .state == "active" then "🟢 ACTIVE" else "🔴 DISABLED" end)\n  ID:     \(.id)"'
+
+    echo "----------------------------------------------------------------------"
+    echo -e "\nFor details: gh-actions-tool details <workflow-name-or-id>"
+}
+
+# ============================================================================
+# Command: details
+# ============================================================================
+cmd_details() {
+    local workflow_ref=""
+    local repo_arg=""
+
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --repo|-R)
+                repo_arg="$2"
+                shift 2
+                ;;
+            *)
+                if [[ -z "$workflow_ref" ]]; then
+                    workflow_ref="$1"
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    if [[ -z "$workflow_ref" ]]; then
+        echo -e "${RED}ERROR: Workflow name or ID required${NC}"
+        echo "Usage: gh-actions-tool details <workflow-name-or-id> [--repo owner/repo]"
+        exit 1
+    fi
+
+    local repo
+    repo=$(get_repo "$repo_arg")
+
+    echo "======================================================================"
+    echo "Workflow Details - Repository: $repo"
+    echo "======================================================================"
+
+    # Get all workflows to find the matching one
+    local workflows
+    workflows=$(gh api "repos/$repo/actions/workflows" --jq '.workflows' 2>/dev/null || echo "[]")
+
+    # Find workflow by name or ID
+    local workflow
+    workflow=$(echo "$workflows" | jq -r --arg ref "$workflow_ref" '.[] | select(.name == $ref or (.id | tostring) == $ref or .path == $ref or (.path | endswith($ref)))')
+
+    if [[ -z "$workflow" ]]; then
+        echo -e "\n${RED}ERROR: Workflow '$workflow_ref' not found${NC}"
+        echo -e "\nAvailable workflows:"
+        echo "$workflows" | jq -r '.[] | "  - \(.name) (ID: \(.id))"'
+        exit 1
+    fi
+
+    local workflow_id
+    workflow_id=$(echo "$workflow" | jq -r '.id')
+    local workflow_name
+    workflow_name=$(echo "$workflow" | jq -r '.name')
+    local workflow_path
+    workflow_path=$(echo "$workflow" | jq -r '.path')
+    local workflow_state
+    workflow_state=$(echo "$workflow" | jq -r '.state')
+
+    echo -e "\nBASIC INFORMATION"
+    echo "----------------------------------------------------------------------"
+    echo "  Name:   $workflow_name"
+    echo "  ID:     $workflow_id"
+    echo "  File:   $workflow_path"
+    echo "  Status: $(if [[ "$workflow_state" == "active" ]]; then echo "🟢 ACTIVE"; else echo "🔴 DISABLED"; fi)"
+
+    # Fetch workflow file content to parse triggers and inputs
+    local workflow_content
+    workflow_content=$(gh api "repos/$repo/contents/$workflow_path" --jq '.content' 2>/dev/null | base64 -d 2>/dev/null || echo "")
+
+    if [[ -n "$workflow_content" ]]; then
+        echo -e "\nTRIGGERS"
+        echo "----------------------------------------------------------------------"
+
+        # Check for common triggers
+        if echo "$workflow_content" | grep -q "push:"; then
+            echo "  - push"
+            local branches
+            branches=$(echo "$workflow_content" | grep -A5 "push:" | grep -E "^\s+branches:" | head -1 || echo "")
+            [[ -n "$branches" ]] && echo "      $branches"
+        fi
+        if echo "$workflow_content" | grep -q "pull_request:"; then
+            echo "  - pull_request"
+        fi
+        if echo "$workflow_content" | grep -q "workflow_dispatch:"; then
+            echo "  - workflow_dispatch (manual trigger)"
+
+            # Check for inputs
+            if echo "$workflow_content" | grep -q "inputs:"; then
+                echo -e "\n  WORKFLOW DISPATCH INPUTS"
+                echo "  ----------------------------------------"
+                # Extract inputs section (simplified parsing)
+                local in_inputs=false
+                local indent_level=0
+                while IFS= read -r line; do
+                    if [[ "$line" =~ ^[[:space:]]*inputs: ]]; then
+                        in_inputs=true
+                        indent_level=$(echo "$line" | sed 's/[^ ].*//' | wc -c)
+                        continue
+                    fi
+                    if [[ "$in_inputs" == true ]]; then
+                        local current_indent
+                        current_indent=$(echo "$line" | sed 's/[^ ].*//' | wc -c)
+                        if [[ $current_indent -le $indent_level && -n "$(echo "$line" | tr -d '[:space:]')" ]]; then
+                            break
+                        fi
+                        if [[ "$line" =~ ^[[:space:]]+([a-zA-Z_][a-zA-Z0-9_]*): ]]; then
+                            echo "    ${BASH_REMATCH[1]}"
+                        fi
+                        if [[ "$line" =~ description:[[:space:]]*(.+) ]]; then
+                            echo "      desc: ${BASH_REMATCH[1]}"
+                        fi
+                        if [[ "$line" =~ default:[[:space:]]*(.+) ]]; then
+                            echo "      default: ${BASH_REMATCH[1]}"
+                        fi
+                        if [[ "$line" =~ required:[[:space:]]*(.+) ]]; then
+                            echo "      required: ${BASH_REMATCH[1]}"
+                        fi
+                        if [[ "$line" =~ type:[[:space:]]*(.+) ]]; then
+                            echo "      type: ${BASH_REMATCH[1]}"
+                        fi
+                    fi
+                done <<< "$workflow_content"
+            fi
+        fi
+        if echo "$workflow_content" | grep -q "schedule:"; then
+            echo "  - schedule (cron)"
+        fi
+        if echo "$workflow_content" | grep -q "workflow_call:"; then
+            echo "  - workflow_call (reusable workflow)"
+        fi
+
+        # Extract jobs
+        echo -e "\nJOBS"
+        echo "----------------------------------------------------------------------"
+        local in_jobs=false
+        while IFS= read -r line; do
+            if [[ "$line" =~ ^jobs: ]]; then
+                in_jobs=true
+                continue
+            fi
+            if [[ "$in_jobs" == true ]]; then
+                if [[ "$line" =~ ^[[:space:]]{2}([a-zA-Z_][a-zA-Z0-9_-]*): ]]; then
+                    echo "  - ${BASH_REMATCH[1]}"
+                fi
+            fi
+        done <<< "$workflow_content"
+    fi
+
+    echo -e "\nHOW TO TRIGGER"
+    echo "----------------------------------------------------------------------"
+    echo "  gh-actions-tool start \"$workflow_name\""
+    echo "  gh-actions-tool start \"$workflow_name\" --input KEY=VALUE"
+    echo "  gh-actions-tool start \"$workflow_name\" --interactive"
+}
+
+# ============================================================================
+# Command: runs
+# ============================================================================
+cmd_runs() {
+    local workflow_ref=""
+    local repo_arg=""
+    local limit=10
+
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --repo|-R)
+                repo_arg="$2"
+                shift 2
+                ;;
+            --limit|-n)
+                limit="$2"
+                shift 2
+                ;;
+            *)
+                if [[ -z "$workflow_ref" && ! "$1" =~ ^- ]]; then
+                    workflow_ref="$1"
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    local repo
+    repo=$(get_repo "$repo_arg")
+
+    echo "================================================================================"
+    local title="Workflow Runs - Repository: $repo"
+    [[ -n "$workflow_ref" ]] && title="$title - Workflow: $workflow_ref"
+    echo "$title"
+    echo "================================================================================"
+
+    local endpoint="repos/$repo/actions/runs?per_page=$limit"
+
+    # If workflow specified, find its ID first
+    if [[ -n "$workflow_ref" ]]; then
+        local workflows
+        workflows=$(gh api "repos/$repo/actions/workflows" --jq '.workflows' 2>/dev/null || echo "[]")
+        local workflow_id
+        workflow_id=$(echo "$workflows" | jq -r --arg ref "$workflow_ref" '.[] | select(.name == $ref or (.id | tostring) == $ref) | .id')
+
+        if [[ -n "$workflow_id" ]]; then
+            endpoint="repos/$repo/actions/workflows/$workflow_id/runs?per_page=$limit"
+        else
+            echo -e "\n${YELLOW}Warning: Workflow '$workflow_ref' not found, showing all runs${NC}"
+        fi
+    fi
+
+    local runs
+    runs=$(gh api "$endpoint" --jq '.workflow_runs' 2>/dev/null || echo "[]")
+
+    if [[ "$runs" == "[]" || -z "$runs" ]]; then
+        echo -e "\nNo workflow runs found."
+        exit 0
+    fi
+
+    local count
+    count=$(echo "$runs" | jq 'length')
+    echo -e "\nShowing $count run(s):\n"
+
+    echo "$runs" | jq -r '.[] |
+        "--------------------------------------------------------------------------------\n  \(
+            if .conclusion == "success" then "✅"
+            elif .conclusion == "failure" then "❌"
+            elif .status == "in_progress" then "🔄"
+            elif .status == "queued" then "⏳"
+            elif .conclusion == "cancelled" then "🚫"
+            elif .conclusion == "skipped" then "⏭️"
+            elif .conclusion == "timed_out" then "⏱️"
+            else "❓"
+        end) \(.status | ascii_upcase) \(if .conclusion then "(\(.conclusion))" else "" end)\n     Run ID:     \(.id)\n     Workflow:   \(.name)\n     Branch:     \(.head_branch // "N/A")\n     Event:      \(.event)\n     Started:    \(.created_at | sub("T"; " ") | sub("Z"; ""))\n     Commit:     \(.head_sha[0:7]) - \(.head_commit.message | split("\n")[0] | .[0:50])"'
+
+    echo "--------------------------------------------------------------------------------"
+
+    # Summary
+    echo -e "\nSummary:"
+    echo "$runs" | jq -r '[.[] | .conclusion // .status] | group_by(.) | map("\(.[0]): \(length)") | join(" | ")'
+}
+
+# ============================================================================
+# Command: running
+# ============================================================================
+cmd_running() {
+    local repo_arg=""
+
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --repo|-R)
+                repo_arg="$2"
+                shift 2
+                ;;
+            *)
+                shift
+                ;;
+        esac
+    done
+
+    local repo
+    repo=$(get_repo "$repo_arg")
+
+    echo "================================================================================"
+    echo "Running Workflows - Repository: $repo"
+    echo "================================================================================"
+
+    local runs
+    runs=$(gh api "repos/$repo/actions/runs?status=in_progress&per_page=50" --jq '.workflow_runs' 2>/dev/null || echo "[]")
+
+    local queued
+    queued=$(gh api "repos/$repo/actions/runs?status=queued&per_page=50" --jq '.workflow_runs' 2>/dev/null || echo "[]")
+
+    local in_progress_count
+    in_progress_count=$(echo "$runs" | jq 'length')
+    local queued_count
+    queued_count=$(echo "$queued" | jq 'length')
+
+    if [[ "$in_progress_count" -eq 0 && "$queued_count" -eq 0 ]]; then
+        echo -e "\n${GREEN}No workflows currently running or queued.${NC}"
+        echo -e "\nTo view recent runs: gh-actions-tool runs"
+        exit 0
+    fi
+
+    if [[ "$in_progress_count" -gt 0 ]]; then
+        echo -e "\n🔄 IN PROGRESS ($in_progress_count):"
+        echo "--------------------------------------------------------------------------------"
+
+        echo "$runs" | jq -r '.[] |
+            "\n  Run ID:    \(.id)\n  Workflow:  \(.name)\n  Branch:    \(.head_branch // "N/A")\n  Event:     \(.event)\n  Started:   \(.created_at | sub("T"; " ") | sub("Z"; ""))\n  Commit:    \(.head_sha[0:7])"'
+    fi
+
+    if [[ "$queued_count" -gt 0 ]]; then
+        echo -e "\n⏳ QUEUED ($queued_count):"
+        echo "--------------------------------------------------------------------------------"
+
+        echo "$queued" | jq -r '.[] |
+            "\n  Run ID:    \(.id)\n  Workflow:  \(.name)\n  Branch:    \(.head_branch // "N/A")"'
+    fi
+
+    echo -e "\n--------------------------------------------------------------------------------"
+    echo -e "\nSummary: 🔄 Running: $in_progress_count | ⏳ Queued: $queued_count"
+    echo -e "\nTo cancel a run: gh-actions-tool cancel <run-id>"
+}
+
+# ============================================================================
+# Command: start
+# ============================================================================
+cmd_start() {
+    local workflow_ref=""
+    local repo_arg=""
+    local ref="main"
+    local interactive=false
+    declare -a inputs=()
+
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --repo|-R)
+                repo_arg="$2"
+                shift 2
+                ;;
+            --ref|-b)
+                ref="$2"
+                shift 2
+                ;;
+            --input|-i)
+                inputs+=("$2")
+                shift 2
+                ;;
+            --interactive)
+                interactive=true
+                shift
+                ;;
+            *)
+                if [[ -z "$workflow_ref" && ! "$1" =~ ^- ]]; then
+                    workflow_ref="$1"
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    if [[ -z "$workflow_ref" ]]; then
+        echo -e "${RED}ERROR: Workflow name or ID required${NC}"
+        echo "Usage: gh-actions-tool start <workflow> [--input KEY=VALUE] [--interactive] [--ref branch]"
+        exit 1
+    fi
+
+    local repo
+    repo=$(get_repo "$repo_arg")
+
+    echo "======================================================================"
+    echo "Start Workflow - Repository: $repo"
+    echo "======================================================================"
+
+    # Find workflow
+    local workflows
+    workflows=$(gh api "repos/$repo/actions/workflows" --jq '.workflows' 2>/dev/null || echo "[]")
+
+    local workflow
+    workflow=$(echo "$workflows" | jq -r --arg ref "$workflow_ref" '.[] | select(.name == $ref or (.id | tostring) == $ref or .path == $ref or (.path | endswith($ref)))')
+
+    if [[ -z "$workflow" ]]; then
+        echo -e "\n${RED}ERROR: Workflow '$workflow_ref' not found${NC}"
+        echo -e "\nAvailable workflows:"
+        echo "$workflows" | jq -r '.[] | "  - \(.name) (ID: \(.id))"'
+        exit 1
+    fi
+
+    local workflow_id
+    workflow_id=$(echo "$workflow" | jq -r '.id')
+    local workflow_name
+    workflow_name=$(echo "$workflow" | jq -r '.name')
+    local workflow_path
+    workflow_path=$(echo "$workflow" | jq -r '.path')
+
+    echo -e "\nWorkflow: $workflow_name"
+    echo "   File:  $workflow_path"
+    echo "   Ref:   $ref"
+
+    # Get workflow file to check for inputs
+    local workflow_content
+    workflow_content=$(gh api "repos/$repo/contents/$workflow_path" --jq '.content' 2>/dev/null | base64 -d 2>/dev/null || echo "")
+
+    # Check if workflow supports workflow_dispatch
+    if ! echo "$workflow_content" | grep -q "workflow_dispatch:"; then
+        echo -e "\n${RED}ERROR: This workflow does not support manual triggering (workflow_dispatch)${NC}"
+        exit 1
+    fi
+
+    # Build inputs JSON
+    local inputs_json="{}"
+
+    if [[ "$interactive" == true ]]; then
+        echo -e "\n${CYAN}Interactive mode - enter input values:${NC}"
+        echo "(Press Enter to skip optional inputs)"
+        echo ""
+
+        # Parse inputs from workflow file
+        local in_inputs=false
+        local current_input=""
+        local input_desc=""
+        local input_required=""
+        local input_default=""
+        local input_type=""
+
+        while IFS= read -r line; do
+            if [[ "$line" =~ ^[[:space:]]*workflow_dispatch: ]]; then
+                in_inputs=false
+            fi
+            if [[ "$line" =~ ^[[:space:]]*inputs: ]]; then
+                in_inputs=true
+                continue
+            fi
+            if [[ "$in_inputs" == true ]]; then
+                # Check if we've left the inputs section
+                if [[ "$line" =~ ^[[:space:]]{0,3}[a-z] && ! "$line" =~ ^[[:space:]]+(description|required|default|type|options): ]]; then
+                    if [[ -n "$current_input" ]]; then
+                        # Prompt for previous input
+                        local prompt="  $current_input"
+                        [[ -n "$input_desc" ]] && prompt="$prompt ($input_desc)"
+                        [[ -n "$input_default" ]] && prompt="$prompt [default: $input_default]"
+                        [[ "$input_required" == "true" ]] && prompt="$prompt *required*"
+                        echo -n "$prompt: "
+                        read -r value
+                        if [[ -n "$value" ]]; then
+                            inputs_json=$(echo "$inputs_json" | jq --arg k "$current_input" --arg v "$value" '. + {($k): $v}')
+                        elif [[ -n "$input_default" ]]; then
+                            inputs_json=$(echo "$inputs_json" | jq --arg k "$current_input" --arg v "$input_default" '. + {($k): $v}')
+                        fi
+                    fi
+                    current_input=""
+                    input_desc=""
+                    input_required=""
+                    input_default=""
+                fi
+
+                if [[ "$line" =~ ^[[:space:]]+([a-zA-Z_][a-zA-Z0-9_]*): ]]; then
+                    current_input="${BASH_REMATCH[1]}"
+                fi
+                if [[ "$line" =~ description:[[:space:]]*[\"\']?([^\"\']+)[\"\']? ]]; then
+                    input_desc="${BASH_REMATCH[1]}"
+                fi
+                if [[ "$line" =~ required:[[:space:]]*(.+) ]]; then
+                    input_required="${BASH_REMATCH[1]}"
+                fi
+                if [[ "$line" =~ default:[[:space:]]*[\"\']?([^\"\']+)[\"\']? ]]; then
+                    input_default="${BASH_REMATCH[1]}"
+                fi
+            fi
+        done <<< "$workflow_content"
+
+        # Handle last input
+        if [[ -n "$current_input" ]]; then
+            local prompt="  $current_input"
+            [[ -n "$input_desc" ]] && prompt="$prompt ($input_desc)"
+            [[ -n "$input_default" ]] && prompt="$prompt [default: $input_default]"
+            [[ "$input_required" == "true" ]] && prompt="$prompt *required*"
+            echo -n "$prompt: "
+            read -r value
+            if [[ -n "$value" ]]; then
+                inputs_json=$(echo "$inputs_json" | jq --arg k "$current_input" --arg v "$value" '. + {($k): $v}')
+            elif [[ -n "$input_default" ]]; then
+                inputs_json=$(echo "$inputs_json" | jq --arg k "$current_input" --arg v "$input_default" '. + {($k): $v}')
+            fi
+        fi
+    else
+        # Process --input flags
+        for input in "${inputs[@]}"; do
+            local key="${input%%=*}"
+            local value="${input#*=}"
+            inputs_json=$(echo "$inputs_json" | jq --arg k "$key" --arg v "$value" '. + {($k): $v}')
+        done
+    fi
+
+    if [[ "$inputs_json" != "{}" ]]; then
+        echo -e "\nInputs:"
+        echo "$inputs_json" | jq -r 'to_entries[] | "   \(.key): \(.value)"'
+    fi
+
+    echo -e "\nTriggering workflow..."
+
+    local payload
+    payload=$(jq -n --arg ref "$ref" --argjson inputs "$inputs_json" '{ref: $ref, inputs: $inputs}')
+
+    if gh api "repos/$repo/actions/workflows/$workflow_id/dispatches" -X POST --input - <<< "$payload" 2>/dev/null; then
+        echo -e "\n${GREEN}Workflow triggered successfully!${NC}"
+        echo -e "\nUseful commands:"
+        echo "   View running:  gh-actions-tool running"
+        echo "   View runs:     gh-actions-tool runs \"$workflow_name\""
+    else
+        echo -e "\n${RED}ERROR: Failed to trigger workflow${NC}"
+        echo "Make sure the workflow has 'workflow_dispatch' trigger enabled."
+        exit 1
+    fi
+}
+
+# ============================================================================
+# Command: logs
+# ============================================================================
+cmd_logs() {
+    local run_id=""
+    local repo_arg=""
+    local job_filter=""
+    local list_jobs=false
+
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --repo|-R)
+                repo_arg="$2"
+                shift 2
+                ;;
+            --job|-j)
+                job_filter="$2"
+                shift 2
+                ;;
+            --list-jobs)
+                list_jobs=true
+                shift
+                ;;
+            *)
+                if [[ -z "$run_id" && ! "$1" =~ ^- ]]; then
+                    run_id="$1"
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    if [[ -z "$run_id" ]]; then
+        echo -e "${RED}ERROR: Run ID required${NC}"
+        echo "Usage: gh-actions-tool logs <run-id> [--job <job-name>] [--list-jobs]"
+        exit 1
+    fi
+
+    local repo
+    repo=$(get_repo "$repo_arg")
+
+    echo "======================================================================"
+    echo "Workflow Run Logs - Repository: $repo"
+    echo "======================================================================"
+
+    # Get run info
+    local run
+    run=$(gh api "repos/$repo/actions/runs/$run_id" 2>/dev/null || echo "")
+
+    if [[ -z "$run" ]]; then
+        echo -e "\n${RED}ERROR: Run '$run_id' not found${NC}"
+        exit 1
+    fi
+
+    local workflow_name
+    workflow_name=$(echo "$run" | jq -r '.name')
+    local status
+    status=$(echo "$run" | jq -r '.status')
+    local conclusion
+    conclusion=$(echo "$run" | jq -r '.conclusion // "pending"')
+
+    echo -e "\nRun ID:     $run_id"
+    echo "Workflow:   $workflow_name"
+    echo "Status:     $status ($conclusion)"
+
+    # Get jobs for this run
+    local jobs
+    jobs=$(gh api "repos/$repo/actions/runs/$run_id/jobs" --jq '.jobs' 2>/dev/null || echo "[]")
+
+    if [[ "$jobs" == "[]" ]]; then
+        echo -e "\nNo jobs found for this run."
+        exit 0
+    fi
+
+    echo -e "\nJobs:"
+    echo "$jobs" | jq -r '.[] | "  - \(.name) [\(.status)\(if .conclusion then " - \(.conclusion)" else "" end)]"'
+
+    if [[ "$list_jobs" == true ]]; then
+        exit 0
+    fi
+
+    # If job filter specified, get logs for that job
+    if [[ -n "$job_filter" ]]; then
+        local job
+        job=$(echo "$jobs" | jq -r --arg name "$job_filter" '.[] | select(.name == $name or (.id | tostring) == $name)')
+
+        if [[ -z "$job" ]]; then
+            echo -e "\n${RED}ERROR: Job '$job_filter' not found${NC}"
+            echo "Available jobs:"
+            echo "$jobs" | jq -r '.[] | "  - \(.name)"'
+            exit 1
+        fi
+
+        local job_id
+        job_id=$(echo "$job" | jq -r '.id')
+
+        echo -e "\n======================================================================"
+        echo "Logs for job: $job_filter"
+        echo "======================================================================"
+
+        gh api "repos/$repo/actions/jobs/$job_id/logs" 2>/dev/null || echo "Unable to fetch logs"
+    else
+        # Download and show all logs
+        echo -e "\n======================================================================"
+        echo "Full Logs (all jobs)"
+        echo "======================================================================"
+
+        # Use gh run view which handles log fetching nicely
+        gh run view "$run_id" --repo "$repo" --log 2>/dev/null || echo "Unable to fetch logs. Run may still be in progress."
+    fi
+}
+
+# ============================================================================
+# Command: cancel
+# ============================================================================
+cmd_cancel() {
+    local run_id=""
+    local repo_arg=""
+
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --repo|-R)
+                repo_arg="$2"
+                shift 2
+                ;;
+            *)
+                if [[ -z "$run_id" && ! "$1" =~ ^- ]]; then
+                    run_id="$1"
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    if [[ -z "$run_id" ]]; then
+        echo -e "${RED}ERROR: Run ID required${NC}"
+        echo "Usage: gh-actions-tool cancel <run-id> [--repo owner/repo]"
+        exit 1
+    fi
+
+    local repo
+    repo=$(get_repo "$repo_arg")
+
+    echo "======================================================================"
+    echo "Cancel Workflow Run - Repository: $repo"
+    echo "======================================================================"
+
+    # Get run info first
+    local run
+    run=$(gh api "repos/$repo/actions/runs/$run_id" 2>/dev/null || echo "")
+
+    if [[ -z "$run" ]]; then
+        echo -e "\n${RED}ERROR: Run '$run_id' not found${NC}"
+        exit 1
+    fi
+
+    local workflow_name
+    workflow_name=$(echo "$run" | jq -r '.name')
+    local status
+    status=$(echo "$run" | jq -r '.status')
+
+    echo -e "\nRun ID:   $run_id"
+    echo "Workflow: $workflow_name"
+    echo "Status:   $status"
+
+    if [[ "$status" != "in_progress" && "$status" != "queued" ]]; then
+        echo -e "\n${YELLOW}Warning: Run is not in progress or queued (status: $status)${NC}"
+    fi
+
+    echo -e "\nCancelling..."
+
+    if gh api "repos/$repo/actions/runs/$run_id/cancel" -X POST 2>/dev/null; then
+        echo -e "\n${GREEN}Run cancelled successfully!${NC}"
+    else
+        echo -e "\n${RED}ERROR: Failed to cancel run${NC}"
+        echo "The run may have already completed or you may not have permission."
+        exit 1
+    fi
+}
+
+# ============================================================================
+# Command: help
+# ============================================================================
+cmd_help() {
+    cat << 'EOF'
+gh-actions-tool - Unified GitHub Actions management tool
+
+USAGE:
+    gh-actions-tool <command> [options]
+
+COMMANDS:
+    auth                    Verify authentication and show current context
+    list                    List all workflows in the repository
+    details <workflow>      Show details for a specific workflow
+    runs [workflow]         Show recent workflow runs
+    running                 Show currently in-progress runs
+    start <workflow>        Trigger a workflow_dispatch
+    logs <run-id>           Fetch and display logs for a run
+    cancel <run-id>         Cancel a running workflow
+    help                    Show this help message
+
+GLOBAL OPTIONS:
+    --repo, -R owner/repo   Specify repository (default: auto-detect from git remote)
+
+EXAMPLES:
+    # Check authentication and detected repo
+    gh-actions-tool auth
+
+    # List all workflows
+    gh-actions-tool list
+
+    # View workflow details
+    gh-actions-tool details "CI Build"
+    gh-actions-tool details ci.yml
+
+    # View workflow runs
+    gh-actions-tool runs
+    gh-actions-tool runs "CI Build" --limit 20
+
+    # Check running workflows
+    gh-actions-tool running
+
+    # Trigger a workflow
+    gh-actions-tool start "Deploy" --ref main
+    gh-actions-tool start "Deploy" --input environment=prod --input version=1.2.3
+    gh-actions-tool start "Deploy" --interactive
+
+    # View logs
+    gh-actions-tool logs 12345678
+    gh-actions-tool logs 12345678 --list-jobs
+    gh-actions-tool logs 12345678 --job "build"
+
+    # Cancel a run
+    gh-actions-tool cancel 12345678
+
+START OPTIONS:
+    --input, -i KEY=VALUE   Input variable (can be repeated)
+    --interactive           Prompt for each input interactively
+    --ref, -b BRANCH        Git ref to run against (default: main)
+
+LOGS OPTIONS:
+    --job, -j JOB_NAME      Show logs for specific job only
+    --list-jobs             List available jobs without showing logs
+
+AUTHENTICATION:
+    If not authenticated, run:
+        gh auth login
+
+EOF
+}
+
+# ============================================================================
+# Main
+# ============================================================================
+main() {
+    local command="${1:-help}"
+    shift || true
+
+    case "$command" in
+        auth)
+            check_gh
+            check_jq
+            cmd_auth "$@"
+            ;;
+        list|ls)
+            check_gh
+            check_jq
+            cmd_list "$@"
+            ;;
+        details|show|describe)
+            check_gh
+            check_jq
+            cmd_details "$@"
+            ;;
+        runs|history)
+            check_gh
+            check_jq
+            cmd_runs "$@"
+            ;;
+        running|status)
+            check_gh
+            check_jq
+            cmd_running "$@"
+            ;;
+        start|run|trigger|dispatch)
+            check_gh
+            check_jq
+            cmd_start "$@"
+            ;;
+        logs|log)
+            check_gh
+            check_jq
+            cmd_logs "$@"
+            ;;
+        cancel|stop)
+            check_gh
+            check_jq
+            cmd_cancel "$@"
+            ;;
+        help|--help|-h)
+            cmd_help
+            ;;
+        *)
+            echo -e "${RED}Unknown command: $command${NC}"
+            echo "Run 'gh-actions-tool help' for usage information."
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"

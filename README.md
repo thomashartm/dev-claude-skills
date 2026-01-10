@@ -7,13 +7,24 @@ A collection of useful Claude Code skills for daily work.
 | Skill | Description |
 |-------|-------------|
 | [gcp-cloudbuild](./gcp-cloudbuild) | Manage Google Cloud Build triggers, view build history, and start builds |
+| [github-actions](./github-actions) | Manage GitHub Actions workflows, view runs, trigger dispatches, and view logs |
 
 ## Installation
 
-Copy any skill folder to your Claude Code skills directory:
+Use the `sync-with-claude` script to install skills to `~/.claude/skills/`:
 
 ```bash
-cp -r <skill-folder> ~/.claude/skills/
+# Interactive mode - select skill(s) from menu
+./sync-with-claude
+
+# Install a specific skill
+./sync-with-claude github-actions
+
+# Install all skills
+./sync-with-claude --all
+
+# List available skills
+./sync-with-claude --list
 ```
 
 ## Skill Structure

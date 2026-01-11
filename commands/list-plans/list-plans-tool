@@ -1,0 +1,398 @@
+#!/usr/bin/env bash
+#
+# list-plans-tool - Display Claude Code plan files with metadata
+#
+# Usage:
+#   list-plans-tool [options]
+#
+# Options:
+#   -a, --all           Show all plans (default: 10 most recent)
+#   -n, --limit N       Show N most recent plans
+#   -f, --filter TEXT   Filter plans by title containing TEXT
+#   --json              Output as JSON
+#   --no-color          Disable color output
+#   -h, --help          Show help message
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PLANS_DIR="$HOME/.claude/plans"
+
+# Default options
+LIMIT=10
+SHOW_ALL=false
+FILTER=""
+JSON_OUTPUT=false
+NO_COLOR=false
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+DIM='\033[2m'
+NC='\033[0m'
+
+# Disable colors if not TTY or --no-color
+setup_colors() {
+    if [[ ! -t 1 ]] || [[ "$NO_COLOR" == true ]]; then
+        RED='' GREEN='' YELLOW='' BLUE='' CYAN='' BOLD='' DIM='' NC=''
+    fi
+}
+
+# ============================================================================
+# Helper Functions
+# ============================================================================
+
+# Extract title from first # heading
+extract_title() {
+    local file="$1"
+    local title
+    title=$(grep -m1 '^# ' "$file" 2>/dev/null | sed 's/^# //' || echo "")
+    if [[ -z "$title" ]]; then
+        # Fallback to filename without extension
+        title=$(basename "$file" .md)
+    fi
+    echo "$title"
+}
+
+# Extract purpose (first non-empty paragraph after title)
+extract_purpose() {
+    local file="$1"
+    local purpose
+    # Skip until first # heading, then get first non-empty, non-heading line
+    purpose=$(awk '
+        /^# / { found=1; next }
+        found && /^[^#\[]/ && NF {
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "")
+            print
+            exit
+        }
+    ' "$file" 2>/dev/null || echo "")
+
+    # Truncate if too long
+    if [[ ${#purpose} -gt 70 ]]; then
+        purpose="${purpose:0:67}..."
+    fi
+    echo "$purpose"
+}
+
+# Count checkboxes [x] and [ ]
+count_checkboxes() {
+    local file="$1"
+    local done todo
+    done=$(grep -c '\[x\]' "$file" 2>/dev/null || echo 0)
+    todo=$(grep -c '\[ \]' "$file" 2>/dev/null || echo 0)
+    echo "$done $todo"
+}
+
+# Get modification time (cross-platform)
+get_modification_time() {
+    local file="$1"
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        stat -f "%Sm" -t "%Y-%m-%d %H:%M" "$file"
+    else
+        stat -c "%y" "$file" 2>/dev/null | cut -d. -f1 | cut -d: -f1,2
+    fi
+}
+
+# Get modification timestamp for sorting
+get_mtime_epoch() {
+    local file="$1"
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        stat -f "%m" "$file"
+    else
+        stat -c "%Y" "$file"
+    fi
+}
+
+# ============================================================================
+# Output Functions
+# ============================================================================
+
+print_header() {
+    echo ""
+    echo -e "${BOLD}══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${BOLD}  Claude Code Plans${NC}"
+    echo -e "${BOLD}══════════════════════════════════════════════════════════════${NC}"
+    echo ""
+}
+
+print_footer() {
+    local showing="$1"
+    local total="$2"
+    echo ""
+    echo -e "${DIM}──────────────────────────────────────────────────────────────${NC}"
+    if [[ "$showing" -lt "$total" ]]; then
+        echo -e "  ${DIM}Showing $showing of $total plans | Use --all to show all${NC}"
+    else
+        echo -e "  ${DIM}Total: $total plan(s)${NC}"
+    fi
+    echo ""
+}
+
+print_plan() {
+    local filename="$1"
+    local title="$2"
+    local purpose="$3"
+    local done="$4"
+    local todo="$5"
+    local modified="$6"
+
+    local total=$((done + todo))
+    local progress_text
+    if [[ "$total" -gt 0 ]]; then
+        progress_text="${done}/${total} tasks"
+    else
+        progress_text="No tasks"
+    fi
+
+    echo -e "  ${CYAN}${filename}${NC}"
+    echo -e "     ${BOLD}Title:${NC}     $title"
+    [[ -n "$purpose" ]] && echo -e "     ${BOLD}Purpose:${NC}   ${DIM}$purpose${NC}"
+    echo -e "     ${BOLD}Progress:${NC}  $progress_text"
+    echo -e "     ${BOLD}Modified:${NC}  $modified"
+    echo ""
+}
+
+# ============================================================================
+# JSON Output
+# ============================================================================
+
+output_json() {
+    local plans=("$@")
+    local total=${#plans[@]}
+
+    echo "{"
+    echo "  \"plans\": ["
+
+    local i=0
+    for plan_data in "${plans[@]}"; do
+        IFS='|' read -r file title purpose done todo modified <<< "$plan_data"
+        local filename=$(basename "$file")
+        local total_tasks=$((done + todo))
+
+        # Escape JSON strings
+        title="${title//\"/\\\"}"
+        purpose="${purpose//\"/\\\"}"
+
+        echo "    {"
+        echo "      \"filename\": \"$filename\","
+        echo "      \"path\": \"$file\","
+        echo "      \"title\": \"$title\","
+        echo "      \"purpose\": \"$purpose\","
+        echo "      \"tasks_done\": $done,"
+        echo "      \"tasks_total\": $total_tasks,"
+        echo "      \"modified\": \"$modified\""
+
+        ((i++))
+        if [[ $i -lt $total ]]; then
+            echo "    },"
+        else
+            echo "    }"
+        fi
+    done
+
+    echo "  ],"
+    echo "  \"total\": $total,"
+    echo "  \"showing\": $total"
+    echo "}"
+}
+
+# ============================================================================
+# Main Logic
+# ============================================================================
+
+list_plans() {
+    # Check if plans directory exists
+    if [[ ! -d "$PLANS_DIR" ]]; then
+        if [[ "$JSON_OUTPUT" == true ]]; then
+            echo '{"plans": [], "total": 0, "showing": 0, "error": "Plans directory not found"}'
+        else
+            echo -e "${YELLOW}Plans directory not found: $PLANS_DIR${NC}"
+            echo "No plans have been created yet."
+        fi
+        return 0
+    fi
+
+    # Find all .md files
+    local plan_files=()
+    while IFS= read -r -d '' file; do
+        plan_files+=("$file")
+    done < <(find "$PLANS_DIR" -maxdepth 1 -name "*.md" -type f -print0 2>/dev/null)
+
+    local total=${#plan_files[@]}
+
+    if [[ "$total" -eq 0 ]]; then
+        if [[ "$JSON_OUTPUT" == true ]]; then
+            echo '{"plans": [], "total": 0, "showing": 0}'
+        else
+            echo -e "${YELLOW}No plans found in: $PLANS_DIR${NC}"
+        fi
+        return 0
+    fi
+
+    # Sort by modification time (newest first)
+    local sorted_files=()
+    while IFS= read -r line; do
+        sorted_files+=("${line#* }")
+    done < <(
+        for f in "${plan_files[@]}"; do
+            echo "$(get_mtime_epoch "$f") $f"
+        done | sort -rn
+    )
+
+    # Collect plan data
+    local plans_data=()
+    local count=0
+
+    for file in "${sorted_files[@]}"; do
+        local filename=$(basename "$file")
+        local title=$(extract_title "$file")
+
+        # Apply filter if set
+        if [[ -n "$FILTER" ]]; then
+            if [[ ! "$title" =~ $FILTER ]] && [[ ! "$filename" =~ $FILTER ]]; then
+                continue
+            fi
+        fi
+
+        local purpose=$(extract_purpose "$file")
+        local checkbox_counts=$(count_checkboxes "$file")
+        local done=$(echo "$checkbox_counts" | cut -d' ' -f1)
+        local todo=$(echo "$checkbox_counts" | cut -d' ' -f2)
+        local modified=$(get_modification_time "$file")
+
+        plans_data+=("$file|$title|$purpose|$done|$todo|$modified")
+
+        ((count++))
+        if [[ "$SHOW_ALL" == false ]] && [[ "$count" -ge "$LIMIT" ]]; then
+            break
+        fi
+    done
+
+    local showing=${#plans_data[@]}
+
+    # Output
+    if [[ "$JSON_OUTPUT" == true ]]; then
+        output_json "${plans_data[@]}"
+    else
+        print_header
+
+        if [[ "$showing" -eq 0 ]]; then
+            echo -e "  ${YELLOW}No plans match filter: $FILTER${NC}"
+        else
+            for plan_data in "${plans_data[@]}"; do
+                IFS='|' read -r file title purpose done todo modified <<< "$plan_data"
+                print_plan "$(basename "$file")" "$title" "$purpose" "$done" "$todo" "$modified"
+            done
+        fi
+
+        print_footer "$showing" "$total"
+    fi
+}
+
+# ============================================================================
+# Help
+# ============================================================================
+
+show_help() {
+    cat << 'EOF'
+list-plans-tool - Display Claude Code plan files with metadata
+
+USAGE:
+    list-plans-tool [options]
+
+OPTIONS:
+    -a, --all           Show all plans (default: 10 most recent)
+    -n, --limit N       Show N most recent plans
+    -f, --filter TEXT   Filter plans by title/filename containing TEXT
+    --json              Output as JSON for scripting
+    --no-color          Disable color output
+    -h, --help          Show this help
+
+EXAMPLES:
+    # Show 10 most recent plans
+    list-plans-tool
+
+    # Show all plans
+    list-plans-tool --all
+
+    # Show 5 most recent
+    list-plans-tool --limit 5
+
+    # Filter by keyword
+    list-plans-tool --filter deploy
+
+    # JSON output for scripting
+    list-plans-tool --json | jq '.plans[0].title'
+
+LOCATION:
+    Plans are read from: ~/.claude/plans/
+
+EOF
+}
+
+# ============================================================================
+# Argument Parsing
+# ============================================================================
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -a|--all)
+                SHOW_ALL=true
+                shift
+                ;;
+            -n|--limit)
+                if [[ -n "${2:-}" ]] && [[ "$2" =~ ^[0-9]+$ ]]; then
+                    LIMIT="$2"
+                    shift 2
+                else
+                    echo "Error: --limit requires a number" >&2
+                    exit 1
+                fi
+                ;;
+            -f|--filter)
+                if [[ -n "${2:-}" ]]; then
+                    FILTER="$2"
+                    shift 2
+                else
+                    echo "Error: --filter requires a search term" >&2
+                    exit 1
+                fi
+                ;;
+            --json)
+                JSON_OUTPUT=true
+                shift
+                ;;
+            --no-color)
+                NO_COLOR=true
+                shift
+                ;;
+            -h|--help)
+                show_help
+                exit 0
+                ;;
+            *)
+                echo "Unknown option: $1" >&2
+                echo "Use --help for usage information" >&2
+                exit 1
+                ;;
+        esac
+    done
+}
+
+# ============================================================================
+# Main
+# ============================================================================
+
+main() {
+    parse_args "$@"
+    setup_colors
+    list_plans
+}
+
+main "$@"

@@ -1,0 +1,595 @@
+#!/usr/bin/env bash
+#
+# install-to-claude - Install/update Claude Code skills and commands to ~/.claude
+#
+# Usage:
+#   install-to-claude                    Interactive mode
+#   install-to-claude --all              Install all skills and commands
+#   install-to-claude --skills           Install only skills
+#   install-to-claude --commands         Install only commands
+#   install-to-claude <name>             Install specific skill or command
+#   install-to-claude --uninstall <name> Uninstall specific item
+#   install-to-claude --dry-run --all    Preview what would be installed
+#   install-to-claude --list             List available and installed items
+#
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CLAUDE_DIR="$HOME/.claude"
+CLAUDE_SKILLS_DIR="$CLAUDE_DIR/skills"
+CLAUDE_COMMANDS_DIR="$CLAUDE_DIR/commands"
+
+# Options
+DRY_RUN=false
+FORCE=false
+UNINSTALL=false
+SKILLS_ONLY=false
+COMMANDS_ONLY=false
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+DIM='\033[2m'
+NC='\033[0m'
+
+# Disable colors if not TTY
+if [[ ! -t 1 ]]; then
+    RED='' GREEN='' YELLOW='' BLUE='' CYAN='' BOLD='' DIM='' NC=''
+fi
+
+# ============================================================================
+# Discovery Functions
+# ============================================================================
+
+# Get list of available skills (directories with SKILL.md in skills/)
+get_skills() {
+    local skills=()
+    local skills_dir="$SCRIPT_DIR/skills"
+
+    [[ ! -d "$skills_dir" ]] && echo "" && return
+
+    for dir in "$skills_dir"/*/; do
+        [[ ! -d "$dir" ]] && continue
+        dir="${dir%/}"
+        local name=$(basename "$dir")
+        [[ "$name" == "TEMPLATE" ]] && continue
+        [[ "$name" == ".git" ]] && continue
+        [[ ! -f "$dir/SKILL.md" ]] && continue
+        skills+=("$name")
+    done
+    echo "${skills[*]:-}"
+}
+
+# Get list of available commands (directories with COMMAND.md in commands/)
+get_commands() {
+    local commands=()
+    local commands_dir="$SCRIPT_DIR/commands"
+
+    [[ ! -d "$commands_dir" ]] && echo "" && return
+
+    for dir in "$commands_dir"/*/; do
+        [[ ! -d "$dir" ]] && continue
+        dir="${dir%/}"
+        local name=$(basename "$dir")
+        [[ ! -f "$dir/COMMAND.md" ]] && continue
+        commands+=("$name")
+    done
+    echo "${commands[*]:-}"
+}
+
+# Check if item is a skill
+is_skill() {
+    local name="$1"
+    [[ -f "$SCRIPT_DIR/skills/$name/SKILL.md" ]]
+}
+
+# Check if item is a command
+is_command() {
+    local name="$1"
+    [[ -f "$SCRIPT_DIR/commands/$name/COMMAND.md" ]]
+}
+
+# ============================================================================
+# Installation Functions
+# ============================================================================
+
+# Create backup of existing directory
+backup_existing() {
+    local target="$1"
+    if [[ -d "$target" ]] && [[ "$FORCE" != true ]]; then
+        local backup="${target}.backup.$(date +%Y%m%d%H%M%S)"
+        if [[ "$DRY_RUN" == true ]]; then
+            echo -e "     ${DIM}Would backup: $target -> $backup${NC}"
+        else
+            cp -R "$target" "$backup"
+            echo -e "     ${DIM}Backup: $(basename "$backup")${NC}"
+        fi
+    fi
+}
+
+# Install a single skill
+install_skill() {
+    local skill_name="$1"
+    local source_dir="$SCRIPT_DIR/skills/$skill_name"
+    local target_dir="$CLAUDE_SKILLS_DIR/$skill_name"
+
+    if [[ ! -d "$source_dir" ]]; then
+        echo -e "  ${RED}ERROR: Skill '$skill_name' not found${NC}"
+        return 1
+    fi
+
+    if [[ ! -f "$source_dir/SKILL.md" ]]; then
+        echo -e "  ${RED}ERROR: '$skill_name' is not a valid skill (missing SKILL.md)${NC}"
+        return 1
+    fi
+
+    if [[ "$DRY_RUN" == true ]]; then
+        echo -e "  ${CYAN}[DRY RUN]${NC} Would install skill: $skill_name -> $target_dir"
+        return 0
+    fi
+
+    backup_existing "$target_dir"
+
+    mkdir -p "$target_dir"
+    rm -rf "${target_dir:?}"/*
+    cp -R "$source_dir"/* "$target_dir/"
+
+    # Make scripts executable
+    find "$target_dir" -type f -name "*-tool" -exec chmod +x {} \;
+    find "$target_dir" -type f -name "*.sh" -exec chmod +x {} \;
+
+    echo -e "  ${GREEN}Installed skill:${NC} $skill_name"
+}
+
+# Install a single command
+install_command() {
+    local cmd_name="$1"
+    local source_dir="$SCRIPT_DIR/commands/$cmd_name"
+    local target_dir="$CLAUDE_COMMANDS_DIR/$cmd_name"
+
+    if [[ ! -d "$source_dir" ]]; then
+        echo -e "  ${RED}ERROR: Command '$cmd_name' not found${NC}"
+        return 1
+    fi
+
+    if [[ ! -f "$source_dir/COMMAND.md" ]]; then
+        echo -e "  ${RED}ERROR: '$cmd_name' is not a valid command (missing COMMAND.md)${NC}"
+        return 1
+    fi
+
+    if [[ "$DRY_RUN" == true ]]; then
+        echo -e "  ${CYAN}[DRY RUN]${NC} Would install command: $cmd_name -> $target_dir"
+        return 0
+    fi
+
+    backup_existing "$target_dir"
+
+    mkdir -p "$target_dir"
+    rm -rf "${target_dir:?}"/*
+    cp -R "$source_dir"/* "$target_dir/"
+
+    # Make scripts executable
+    find "$target_dir" -type f -name "*-tool" -exec chmod +x {} \;
+    find "$target_dir" -type f -name "*.sh" -exec chmod +x {} \;
+
+    echo -e "  ${GREEN}Installed command:${NC} $cmd_name"
+}
+
+# Uninstall a skill
+uninstall_skill() {
+    local skill_name="$1"
+    local target_dir="$CLAUDE_SKILLS_DIR/$skill_name"
+
+    if [[ ! -d "$target_dir" ]]; then
+        echo -e "  ${YELLOW}Skill '$skill_name' not installed${NC}"
+        return 0
+    fi
+
+    if [[ "$DRY_RUN" == true ]]; then
+        echo -e "  ${CYAN}[DRY RUN]${NC} Would uninstall skill: $skill_name"
+        return 0
+    fi
+
+    rm -rf "$target_dir"
+    echo -e "  ${GREEN}Uninstalled skill:${NC} $skill_name"
+}
+
+# Uninstall a command
+uninstall_command() {
+    local cmd_name="$1"
+    local target_dir="$CLAUDE_COMMANDS_DIR/$cmd_name"
+
+    if [[ ! -d "$target_dir" ]]; then
+        echo -e "  ${YELLOW}Command '$cmd_name' not installed${NC}"
+        return 0
+    fi
+
+    if [[ "$DRY_RUN" == true ]]; then
+        echo -e "  ${CYAN}[DRY RUN]${NC} Would uninstall command: $cmd_name"
+        return 0
+    fi
+
+    rm -rf "$target_dir"
+    echo -e "  ${GREEN}Uninstalled command:${NC} $cmd_name"
+}
+
+# ============================================================================
+# Batch Operations
+# ============================================================================
+
+# Ensure target directories exist
+ensure_dirs() {
+    if [[ "$DRY_RUN" != true ]]; then
+        mkdir -p "$CLAUDE_SKILLS_DIR" "$CLAUDE_COMMANDS_DIR"
+    fi
+}
+
+# Install all skills
+install_all_skills() {
+    local skills
+    read -ra skills <<< "$(get_skills)"
+
+    if [[ ${#skills[@]} -eq 0 ]] || [[ -z "${skills[0]:-}" ]]; then
+        echo -e "  ${DIM}No skills found${NC}"
+        return 0
+    fi
+
+    for skill in "${skills[@]}"; do
+        install_skill "$skill"
+    done
+}
+
+# Install all commands
+install_all_commands() {
+    local commands
+    read -ra commands <<< "$(get_commands)"
+
+    if [[ ${#commands[@]} -eq 0 ]] || [[ -z "${commands[0]:-}" ]]; then
+        echo -e "  ${DIM}No commands found${NC}"
+        return 0
+    fi
+
+    for cmd in "${commands[@]}"; do
+        install_command "$cmd"
+    done
+}
+
+# Install everything
+install_all() {
+    ensure_dirs
+
+    echo ""
+    echo -e "${BOLD}Installing Skills${NC}"
+    echo -e "${DIM}────────────────────────────────────────${NC}"
+    install_all_skills
+
+    echo ""
+    echo -e "${BOLD}Installing Commands${NC}"
+    echo -e "${DIM}────────────────────────────────────────${NC}"
+    install_all_commands
+}
+
+# ============================================================================
+# List & Interactive
+# ============================================================================
+
+# List available items
+list_items() {
+    local skills commands
+    read -ra skills <<< "$(get_skills)"
+    read -ra commands <<< "$(get_commands)"
+
+    echo ""
+    echo -e "${BOLD}Available Skills:${NC}"
+    echo -e "${DIM}────────────────────────────────────────${NC}"
+    if [[ ${#skills[@]} -eq 0 ]] || [[ -z "${skills[0]:-}" ]]; then
+        echo -e "  ${DIM}(none)${NC}"
+    else
+        for skill in "${skills[@]}"; do
+            local installed=""
+            [[ -d "$CLAUDE_SKILLS_DIR/$skill" ]] && installed=" ${GREEN}(installed)${NC}"
+            local desc=""
+            if [[ -f "$SCRIPT_DIR/skills/$skill/SKILL.md" ]]; then
+                desc=$(grep -m1 "^description:" "$SCRIPT_DIR/skills/$skill/SKILL.md" 2>/dev/null | sed 's/^description:[[:space:]]*//' | cut -c1-50 || echo "")
+                [[ ${#desc} -eq 50 ]] && desc="${desc}..."
+            fi
+            echo -e "  ${CYAN}$skill${NC}$installed"
+            [[ -n "$desc" ]] && echo -e "    ${DIM}$desc${NC}"
+        done
+    fi
+
+    echo ""
+    echo -e "${BOLD}Available Commands:${NC}"
+    echo -e "${DIM}────────────────────────────────────────${NC}"
+    if [[ ${#commands[@]} -eq 0 ]] || [[ -z "${commands[0]:-}" ]]; then
+        echo -e "  ${DIM}(none)${NC}"
+    else
+        for cmd in "${commands[@]}"; do
+            local installed=""
+            [[ -d "$CLAUDE_COMMANDS_DIR/$cmd" ]] && installed=" ${GREEN}(installed)${NC}"
+            local desc=""
+            if [[ -f "$SCRIPT_DIR/commands/$cmd/COMMAND.md" ]]; then
+                desc=$(grep -m1 "^description:" "$SCRIPT_DIR/commands/$cmd/COMMAND.md" 2>/dev/null | sed 's/^description:[[:space:]]*//' | cut -c1-50 || echo "")
+                [[ ${#desc} -eq 50 ]] && desc="${desc}..."
+            fi
+            echo -e "  ${CYAN}$cmd${NC}$installed"
+            [[ -n "$desc" ]] && echo -e "    ${DIM}$desc${NC}"
+        done
+    fi
+    echo ""
+}
+
+# Interactive menu
+interactive_menu() {
+    local skills commands all_items=()
+    read -ra skills <<< "$(get_skills)"
+    read -ra commands <<< "$(get_commands)"
+
+    # Build combined list
+    for skill in "${skills[@]}"; do
+        [[ -n "$skill" ]] && all_items+=("skill:$skill")
+    done
+    for cmd in "${commands[@]}"; do
+        [[ -n "$cmd" ]] && all_items+=("command:$cmd")
+    done
+
+    if [[ ${#all_items[@]} -eq 0 ]]; then
+        echo -e "${YELLOW}No skills or commands found to install.${NC}"
+        exit 0
+    fi
+
+    echo ""
+    echo -e "${BOLD}Available Items:${NC}"
+    echo -e "${DIM}────────────────────────────────────────${NC}"
+
+    local i=1
+    for item in "${all_items[@]}"; do
+        local type="${item%%:*}"
+        local name="${item#*:}"
+        local installed=""
+        if [[ "$type" == "skill" ]] && [[ -d "$CLAUDE_SKILLS_DIR/$name" ]]; then
+            installed=" ${GREEN}(installed)${NC}"
+        elif [[ "$type" == "command" ]] && [[ -d "$CLAUDE_COMMANDS_DIR/$name" ]]; then
+            installed=" ${GREEN}(installed)${NC}"
+        fi
+        echo -e "  ${CYAN}[$i]${NC} ${DIM}[$type]${NC} $name$installed"
+        ((i++))
+    done
+
+    echo ""
+    echo -e "  ${CYAN}[a]${NC} Install ALL"
+    echo -e "  ${CYAN}[q]${NC} Quit"
+    echo ""
+
+    read -rp "Select item(s) to install (number, 'a' for all, 'q' to quit): " choice
+
+    case "$choice" in
+        q|Q)
+            echo "Cancelled."
+            exit 0
+            ;;
+        a|A)
+            install_all
+            ;;
+        *)
+            if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 1 ]] && [[ "$choice" -le ${#all_items[@]} ]]; then
+                ensure_dirs
+                local selected="${all_items[$((choice-1))]}"
+                local type="${selected%%:*}"
+                local name="${selected#*:}"
+                if [[ "$type" == "skill" ]]; then
+                    install_skill "$name"
+                else
+                    install_command "$name"
+                fi
+            else
+                echo -e "${RED}Invalid selection${NC}"
+                exit 1
+            fi
+            ;;
+    esac
+}
+
+# ============================================================================
+# Help
+# ============================================================================
+
+show_help() {
+    cat << 'EOF'
+install-to-claude - Install/update Claude Code skills and commands
+
+USAGE:
+    install-to-claude                      Interactive mode
+    install-to-claude --all                Install all skills and commands
+    install-to-claude --skills             Install only skills
+    install-to-claude --commands           Install only commands
+    install-to-claude <name>               Install specific skill or command
+    install-to-claude --uninstall <name>   Uninstall specific item
+    install-to-claude --uninstall --all    Uninstall all installed items
+    install-to-claude --list               List available items
+    install-to-claude --dry-run --all      Preview installation
+    install-to-claude --help               Show this help
+
+OPTIONS:
+    -a, --all          Install/uninstall all items
+    --skills           Target only skills
+    --commands         Target only commands
+    --dry-run          Show what would be done without doing it
+    --force            Overwrite without creating backup
+    --uninstall        Remove instead of install
+    -l, --list         List available items
+    -h, --help         Show this help
+
+EXAMPLES:
+    # Interactive selection
+    install-to-claude
+
+    # Install everything
+    install-to-claude --all
+
+    # Install specific skill
+    install-to-claude github-actions
+
+    # Install specific command
+    install-to-claude list-plans
+
+    # Preview what would be installed
+    install-to-claude --dry-run --all
+
+    # Uninstall a command
+    install-to-claude --uninstall list-plans
+
+DESTINATIONS:
+    Skills:   ~/.claude/skills/
+    Commands: ~/.claude/commands/
+
+EOF
+}
+
+# ============================================================================
+# Main
+# ============================================================================
+
+main() {
+    local positional_args=()
+
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                show_help
+                exit 0
+                ;;
+            -l|--list)
+                list_items
+                exit 0
+                ;;
+            -a|--all)
+                positional_args+=("--all")
+                shift
+                ;;
+            --skills)
+                SKILLS_ONLY=true
+                shift
+                ;;
+            --commands)
+                COMMANDS_ONLY=true
+                shift
+                ;;
+            --dry-run)
+                DRY_RUN=true
+                shift
+                ;;
+            --force)
+                FORCE=true
+                shift
+                ;;
+            --uninstall)
+                UNINSTALL=true
+                shift
+                ;;
+            -*)
+                echo -e "${RED}Unknown option: $1${NC}" >&2
+                echo "Use --help for usage information" >&2
+                exit 1
+                ;;
+            *)
+                positional_args+=("$1")
+                shift
+                ;;
+        esac
+    done
+
+    echo "=============================================="
+    echo "  Claude Code Installer"
+    echo "=============================================="
+
+    if [[ "$DRY_RUN" == true ]]; then
+        echo -e "${YELLOW}DRY RUN MODE - No changes will be made${NC}"
+    fi
+
+    # Handle --all flag
+    if [[ " ${positional_args[*]} " =~ " --all " ]]; then
+        ensure_dirs
+        if [[ "$UNINSTALL" == true ]]; then
+            echo ""
+            echo -e "${BOLD}Uninstalling...${NC}"
+            if [[ "$COMMANDS_ONLY" != true ]]; then
+                local skills
+                read -ra skills <<< "$(get_skills)"
+                for skill in "${skills[@]}"; do
+                    [[ -n "$skill" ]] && uninstall_skill "$skill"
+                done
+            fi
+            if [[ "$SKILLS_ONLY" != true ]]; then
+                local commands
+                read -ra commands <<< "$(get_commands)"
+                for cmd in "${commands[@]}"; do
+                    [[ -n "$cmd" ]] && uninstall_command "$cmd"
+                done
+            fi
+        else
+            if [[ "$SKILLS_ONLY" == true ]]; then
+                echo ""
+                echo -e "${BOLD}Installing Skills${NC}"
+                echo -e "${DIM}────────────────────────────────────────${NC}"
+                install_all_skills
+            elif [[ "$COMMANDS_ONLY" == true ]]; then
+                echo ""
+                echo -e "${BOLD}Installing Commands${NC}"
+                echo -e "${DIM}────────────────────────────────────────${NC}"
+                install_all_commands
+            else
+                install_all
+            fi
+        fi
+    elif [[ ${#positional_args[@]} -gt 0 ]]; then
+        # Specific item provided
+        ensure_dirs
+        local name="${positional_args[0]}"
+
+        if [[ "$UNINSTALL" == true ]]; then
+            if is_skill "$name"; then
+                uninstall_skill "$name"
+            elif is_command "$name"; then
+                uninstall_command "$name"
+            elif [[ -d "$CLAUDE_SKILLS_DIR/$name" ]]; then
+                uninstall_skill "$name"
+            elif [[ -d "$CLAUDE_COMMANDS_DIR/$name" ]]; then
+                uninstall_command "$name"
+            else
+                echo -e "${RED}ERROR: '$name' not found as skill or command${NC}"
+                exit 1
+            fi
+        else
+            if is_skill "$name"; then
+                install_skill "$name"
+            elif is_command "$name"; then
+                install_command "$name"
+            else
+                echo -e "${RED}ERROR: '$name' not found as skill or command${NC}"
+                echo "Use --list to see available items"
+                exit 1
+            fi
+        fi
+    else
+        # Interactive mode
+        interactive_menu
+    fi
+
+    echo ""
+    if [[ "$DRY_RUN" == true ]]; then
+        echo -e "${YELLOW}DRY RUN complete - no changes made${NC}"
+    else
+        echo -e "${GREEN}Done!${NC}"
+    fi
+    echo -e "Skills:   $CLAUDE_SKILLS_DIR"
+    echo -e "Commands: $CLAUDE_COMMANDS_DIR"
+}
+
+main "$@"

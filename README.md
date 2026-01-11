@@ -1,18 +1,6 @@
-# Claude Code Skills & Commands
+# Claude Code Skills
 
-A collection of useful Claude Code skills and commands for daily development and ops work.
-
-## Directory Structure
-
-```
-claude-skills/
-├── install-to-claude         # Installer script
-├── commands/                  # Claude Code commands
-│   └── list-plans/           # /list-plans command
-└── skills/                   # Claude Code skills
-    ├── gcp-cloudbuild/       # GCP Cloud Build management
-    └── github-actions/       # GitHub Actions management
-```
+A collection of useful Claude Code skills for daily development and ops work.
 
 ## Available Skills
 
@@ -20,58 +8,39 @@ claude-skills/
 |-------|-------------|
 | [gcp-cloudbuild](./skills/gcp-cloudbuild) | Manage Google Cloud Build triggers, view build history, and start builds |
 | [github-actions](./skills/github-actions) | Manage GitHub Actions workflows, view runs, trigger dispatches, and view logs |
-
-## Available Commands
-
-| Command | Description |
-|---------|-------------|
-| [list-plans](./commands/list-plans) | List Claude Code plan files with titles, purposes, and progress |
+| [list-plans](./skills/list-plans) | List Claude Code plan files with titles, purposes, and progress |
 
 ## Installation
 
-Use the `install-to-claude` script to install skills and commands to `~/.claude/`:
+Use the `install-to-claude` script to install skills to `~/.claude/skills/`:
 
 ```bash
 # Interactive mode - select from menu
 ./install-to-claude
 
-# Install everything
+# Install all skills
 ./install-to-claude --all
 
-# Install only skills
-./install-to-claude --skills
-
-# Install only commands
-./install-to-claude --commands
-
-# Install a specific item
-./install-to-claude github-actions
+# Install a specific skill
 ./install-to-claude list-plans
 
 # Preview what would be installed
 ./install-to-claude --dry-run --all
 
-# List available items
+# List available skills
 ./install-to-claude --list
 
-# Uninstall an item
+# Uninstall a skill
 ./install-to-claude --uninstall list-plans
+
+# Clean up old backup directories
+./install-to-claude --cleanup
 ```
 
-## Structure
+## Skill Structure
 
-### Skills
-
-Skills are domain expertise modules that Claude uses to handle specialized tasks. Each skill contains:
-- `SKILL.md` - Skill definition with YAML frontmatter (name, description) and instructions
+Each skill directory contains:
+- `SKILL.md` - Skill definition with YAML frontmatter (name, description) and instructions for Claude
 - Executable scripts/tools used by the skill
 
 Skills are installed to: `~/.claude/skills/`
-
-### Commands
-
-Commands are slash commands that users can invoke directly. Each command contains:
-- `COMMAND.md` - Command definition with YAML frontmatter (name, description) and usage docs
-- Executable scripts/tools used by the command
-
-Commands are installed to: `~/.claude/commands/`

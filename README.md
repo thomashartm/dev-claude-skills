@@ -8,6 +8,7 @@ A collection of useful Claude Code skills for daily development and ops work.
 |-------|-------------|
 | [gcp-cloudbuild](./skills/gcp-cloudbuild) | Manage Google Cloud Build triggers, view build history, and start builds |
 | [github-actions](./skills/github-actions) | Manage GitHub Actions workflows, view runs, trigger dispatches, and view logs |
+| [install-python-agents](./skills/install-python-agents) | Install Python Clean Architecture agents (architect, domain-modeler, implementer, test-engineer, code-reviewer) into a project |
 | [list-plans](./skills/list-plans) | List Claude Code plan files with titles, purposes, and progress |
 
 ## Installation
